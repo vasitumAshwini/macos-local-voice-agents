@@ -79,7 +79,8 @@ async def run_bot(webrtc_connection):
 
     llm = OpenAILLMService(
         api_key="dummyKey",
-        model="gemma-3n-e4b-it-text",  # Small model. Uses ~4GB of RAM.
+        model="gemma-4-e4b-it", # Latest and greatest model. Uses ~8GB of RAM. as of APR 2026.
+        #model="gemma-3n-e4b-it-text",  # Small model. Uses ~4GB of RAM.
         # model="google/gemma-3-12b",  # Medium-sized model. Uses ~8.5GB of RAM.
         # model="mlx-community/Qwen3-235B-A22B-Instruct-2507-3bit-DWQ", # Large model. Uses ~110GB of RAM!
         base_url="http://127.0.0.1:1234/v1",
