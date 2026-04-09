@@ -14,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI
 from loguru import logger
 
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
-from pipecat.audio.turn.smart_turn.local_smart_turn_v2 import LocalSmartTurnAnalyzerV2
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.pipeline.pipeline import Pipeline
@@ -22,7 +22,6 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.services.openai.llm import OpenAILLMService
-
 from pipecat.services.whisper.stt import WhisperSTTServiceMLX, MLXModel
 from pipecat.transports.base_transport import TransportParams
 from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
@@ -35,7 +34,6 @@ from tts_mlx_isolated import TTSMLXIsolated
 load_dotenv(override=True)
 
 app = FastAPI()
-
 pcs_map: Dict[str, SmallWebRTCConnection] = {}
 
 ice_servers = [
@@ -44,38 +42,57 @@ ice_servers = [
     )
 ]
 
-
 SYSTEM_INSTRUCTION = """
-"You are Pipecat, a friendly, helpful chatbot.
+You are Pipecat, a friendly, helpful chatbot.
 
 Your input is text transcribed in realtime from the user's voice. There may be transcription errors. Adjust your responses automatically to account for these errors.
 
-Your output will be converted to audio so don't include special characters in your answers and do not use any markdown or special formatting.
+Your output will be converted to audio so do not include markdown or special formatting.
 
-Respond to what the user said in a creative and helpful way. Keep your responses brief unless you are explicitly asked for long or detailed responses. Normally you should use one or two sentences at most. Keep each sentence short. Prefer simple sentences. Try not to use long sentences with multiple comma clauses.
+Respond briefly unless the user asks for detail. Prefer one or two short sentences.
+
+Latency behavior:
+- If you need a moment, start with a short filler such as "Hmm..." or "Okay..." and then continue.
+- Keep filler words very short and only use them when needed.
+- Do not overuse filler words.
 
 Start the conversation by saying, "Hello, I'm Pipecat!" Then stop and wait for the user.
-"""
+""".strip()
 
 
 async def run_bot(webrtc_connection):
+    # VAD is the first gate. 0.35s is a practical "tight but not too tight" silence threshold.
+    # Pipecat's default smart-turn guidance still recommends short silence windows, and smart turn
+    # works best when VAD stop_secs is kept low. :contentReference[oaicite:1]{index=1}
     transport = SmallWebRTCTransport(
         webrtc_connection=webrtc_connection,
         params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
-            turn_analyzer=LocalSmartTurnAnalyzerV2(
-                smart_turn_model_path="",  # Download from HuggingFace
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.35)),
+            turn_analyzer=LocalSmartTurnAnalyzerV3(
+                smart_turn_model_path="",  # downloaded from HuggingFace cache
                 params=SmartTurnParams(),
             ),
         ),
     )
 
-    stt = WhisperSTTServiceMLX(model=MLXModel.LARGE_V3_TURBO_Q4)
+    # NOTE:
+    # Whisper MLX here is still a turn-final ASR path, not true partial-transcript streaming.
+    # For real multi-stage streaming STT, replace this with a streaming STT backend.
+    stt = WhisperSTTServiceMLX(
+        model=MLXModel.BASE, # Faster than LARGE on M1 for voice
+        device="gpu"         # Explicitly target the GPU
+    )
 
-    tts = TTSMLXIsolated(model="mlx-community/Kokoro-82M-bf16", voice="af_heart", sample_rate=24000)
-    # tts = TTSMLXIsolated(model="Marvis-AI/marvis-tts-250m-v0.1", voice=None)
+    # NOTE:
+    # This TTS is local and simple, but not a true chunked/streaming TTS engine.
+    # For real dual-streaming TTS, replace with a streaming TTS service.
+    tts = TTSMLXIsolated(
+        model="mlx-community/Kokoro-82M-bf16",
+        voice="af_heart",
+        sample_rate=24000,
+    )
 
     llm = OpenAILLMService(
         api_key="dummyKey",
@@ -90,11 +107,12 @@ async def run_bot(webrtc_connection):
     context = OpenAILLMContext(
         [
             {
-                "role": "user",
+                "role": "system",
                 "content": SYSTEM_INSTRUCTION,
             }
         ],
     )
+
     context_aggregator = llm.create_context_aggregator(
         context,
         # Whisper local service isn't streaming, so it delivers the full text all at
@@ -127,6 +145,10 @@ async def run_bot(webrtc_connection):
         params=PipelineParams(
             enable_metrics=True,
             enable_usage_metrics=True,
+            # Keep sample formats aligned to reduce hidden resampling overhead.
+            # If your transport / TTS backend expects other rates, update them together.
+            audio_in_sample_rate=16000,
+            audio_out_sample_rate=24000,
         ),
         observers=[RTVIObserver(rtvi)],
     )
@@ -134,7 +156,6 @@ async def run_bot(webrtc_connection):
     @rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
         await rtvi.set_bot_ready()
-        # Kick off the conversation
         await task.queue_frames([context_aggregator.user().get_context_frame()])
 
     @transport.event_handler("on_first_participant_joined")
@@ -148,7 +169,6 @@ async def run_bot(webrtc_connection):
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=False)
-
     await runner.run(task)
 
 
@@ -173,19 +193,16 @@ async def offer(request: dict, background_tasks: BackgroundTasks):
             logger.info(f"Discarding peer connection for pc_id: {webrtc_connection.pc_id}")
             pcs_map.pop(webrtc_connection.pc_id, None)
 
-        # Run example function with SmallWebRTC transport arguments.
         background_tasks.add_task(run_bot, pipecat_connection)
 
     answer = pipecat_connection.get_answer()
-    # Updating the peer connection inside the map
     pcs_map[answer["pc_id"]] = pipecat_connection
-
     return answer
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield  # Run app
+    yield
     coros = [pc.disconnect() for pc in pcs_map.values()]
     await asyncio.gather(*coros)
     pcs_map.clear()
@@ -193,12 +210,8 @@ async def lifespan(app: FastAPI):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pipecat Bot Runner")
-    parser.add_argument(
-        "--host", default="localhost", help="Host for HTTP server (default: localhost)"
-    )
-    parser.add_argument(
-        "--port", type=int, default=7860, help="Port for HTTP server (default: 7860)"
-    )
+    parser.add_argument("--host", default="localhost", help="Host for HTTP server")
+    parser.add_argument("--port", type=int, default=7860, help="Port for HTTP server")
     args = parser.parse_args()
 
     uvicorn.run(app, host=args.host, port=args.port)
